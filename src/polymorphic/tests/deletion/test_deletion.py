@@ -813,3 +813,131 @@ class TestDeletion(TestCase):
         assert Normal3.objects.count() == 4
         assert Normal3.objects.get(pk=b1_pk).__class__ is Normal3
         assert not Poly3.objects.filter(pk=b1_pk).exists()
+
+    def test_delete_keep_parents_deep_inheritance(self):
+        """
+        Test that delete(keep_parents=True) correctly updates polymorphic_ctype on
+        every polymorphic ancestor across a 3+ level concrete inheritance chain.
+
+        Scenario:
+            A_274 (PolymorphicModel)
+              |
+            B_274 (concrete)
+              |
+            C_274 (concrete)
+
+        When a C_274 instance is deleted with keep_parents=True, the row
+        remains in both A_274 and B_274 tables. Both rows MUST have
+        polymorphic_ctype updated. The existing bug only updated the
+        direct parent (B_274) leaving A_274.ctype pointing to the deleted
+        subclass -- causing stale/orphaned ctype references when queried
+        from the root model.
+        """
+        from .models import A_274, B_274, C_274
+
+        c1 = C_274.objects.create()
+        c1_pk = c1.pk
+
+        # Sanity check: fresh instance's ctype points to C_274 at every level
+        # of the concrete chain (Django shares pk across all tables in MTI).
+        a_ctype = (
+            A_274.objects.non_polymorphic()
+            .get(pk=c1_pk)
+            .polymorphic_ctype_id
+        )
+        b_ctype = (
+            B_274.objects.non_polymorphic()
+            .get(pk=c1_pk)
+            .polymorphic_ctype_id
+        )
+        assert a_ctype == b_ctype
+
+        c1.delete(keep_parents=True)
+
+        # The child row should be gone; parent rows remain.
+        assert not C_274.objects.filter(pk=c1_pk).exists()
+        assert B_274.objects.filter(pk=c1_pk).exists()
+        assert A_274.objects.filter(pk=c1_pk).exists()
+
+        # The remaining rows at every polymorphic ancestor must now point to their
+        # own concrete class -- NOT to the deleted C_274.
+        a_row = A_274.objects.non_polymorphic().get(pk=c1_pk)
+        b_row = B_274.objects.non_polymorphic().get(pk=c1_pk)
+
+        # When queried through their respective managers, each surviving row
+        # must resolve to its own model class (i.e. no stale ctype
+        # reference to C_274).
+        assert a_row.get_real_instance_class() is A_274
+        assert b_row.get_real_instance_class() is B_274
+
+        # The row at the root polymorphic query should return a regular
+        # (non-polymorphic) A_274 instance when iterating from the top.
+        assert A_274.objects.filter(pk=c1_pk).first().__class__ is A_274
+        # Similarly, B_274.objects should return a B_274 for that pk.
+        assert B_274.objects.filter(pk=c1_pk).first().__class__ is B_274
+
+    def test_delete_keep_parents_four_level_inheritance(self):
+        """
+        Same as above, but with a 4-level concrete chain to ensure the
+        fix walks the full chain, not just direct parents.
+
+            A_274 (PolymorphicModel)
+              |
+            D_274 (concrete)
+              |
+            E_274 (concrete)
+
+        (We reuse D_274 / E_274 which already exist as a 3-level chain
+        A_274 -> D_274 -> E_274.)
+        """
+        from .models import A_274, D_274, E_274
+
+        e1 = E_274.objects.create()
+        e1_pk = e1.pk
+
+        e1.delete(keep_parents=True)
+
+        assert not E_274.objects.filter(pk=e1_pk).exists()
+        assert D_274.objects.filter(pk=e1_pk).exists()
+        assert A_274.objects.filter(pk=e1_pk).exists()
+
+        a_row = A_274.objects.non_polymorphic().get(pk=e1_pk)
+        d_row = D_274.objects.non_polymorphic().get(pk=e1_pk)
+
+        assert a_row.get_real_instance_class() is A_274
+        assert d_row.get_real_instance_class() is D_274
+
+        # Root-level polymorphic query returns the top-most surviving class.
+        assert A_274.objects.get(pk=e1_pk).__class__ is A_274
+        assert D_274.objects.get(pk=e1_pk).__class__ is D_274
+
+    def test_delete_keep_parents_plain_django_untouched(self):
+        """
+        Deleting non-polymorphic models (Django vanilla MTI) must keep its
+        default behaviour -- i.e. the new logic should only touch rows that
+        belong to polymorphic ancestors.
+        """
+        from .models import PlainA, PlainB1, PlainC1
+
+        c1 = PlainC1.objects.create()
+        c1_pk = c1.pk
+        c1.delete(keep_parents=True)
+
+        assert not PlainC1.objects.filter(pk=c1_pk).exists()
+        assert PlainB1.objects.filter(pk=c1_pk).exists()
+        assert PlainA.objects.filter(pk=c1_pk).exists()
+
+    def test_delete_without_keep_parents_still_works(self):
+        """
+        When keep_parents=False (default): every row in the chain must be
+        removed -- including rows at polymorphic ancestor tables.
+        """
+        from .models import A_274, B_274, C_274
+
+        c1 = C_274.objects.create()
+        c1_pk = c1.pk
+        c1.delete()
+
+        assert not C_274.objects.filter(pk=c1_pk).exists()
+        assert not B_274.objects.filter(pk=c1_pk).exists()
+        assert not A_274.objects.filter(pk=c1_pk).exists()

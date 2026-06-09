@@ -245,20 +245,43 @@ class PolymorphicModel(models.Model, metaclass=PolymorphicModelBase):
         """
         Behaves the same as Django's default :meth:`~django.db.models.Model.delete()`,
         but with support for upcasting when ``keep_parents`` is True. When keeping
-        parents (upcasting the row) the ``polymorphic_ctype`` fields of the parent rows
-        are updated accordingly in a transaction with the child row deletion.
+        parents (upcasting the row) the ``polymorphic_ctype`` fields of **every**
+        polymorphic ancestor row are updated accordingly in a transaction with the
+        child row deletion -- not just the direct parent.
+
+        Walking the full inheritance chain is important for multi-table-inheritance
+        chains of depth three or greater, e.g. ``Root -> Middle -> Leaf``. Without
+        walking the full chain ``Root.polymorphic_ctype`` would still point at
+        ``Leaf`` after ``leaf.delete(keep_parents=True)``, leaving a stale/orphaned
+        content-type reference.
         """
-        # if we are keeping parents, we must first determine which polymorphic_ctypes we
-        # need to update
-        parent_updates = (
-            [
-                (parent_model, getattr(self, parent_field.get_attname()))  # type: ignore[union-attr]
-                for parent_model, parent_field in self._meta.parents.items()
-                if issubclass(parent_model, PolymorphicModel)
-            ]
-            if keep_parents
-            else []
-        )
+        # If we are keeping parents, we must collect every polymorphic ancestor
+        # (not only the direct parent) so that every remaining table has a
+        # correct polymorphic_ctype after deletion of the child row.
+        if keep_parents:
+            parent_updates: list[tuple[type[PolymorphicModel], int | None]] = []
+
+            def _collect_polymorphic_parents(
+                model: type[models.Model],
+            ) -> None:
+                for parent_model in model._meta.parents:
+                    # Django stores abstract base classes in ``_meta.parents`` too,
+                    # but they don't map to a real table so there is nothing to
+                    # update. We only care about concrete polymorphic ancestors.
+                    if (
+                        not parent_model._meta.abstract
+                        and issubclass(parent_model, PolymorphicModel)
+                    ):
+                        # All concrete multi-table parents share the primary key
+                        # value of the child instance in Django, so we can use
+                        # ``self.pk`` to address each ancestor row.
+                        parent_updates.append((parent_model, self.pk))
+                    _collect_polymorphic_parents(parent_model)
+
+            _collect_polymorphic_parents(self.__class__)
+        else:
+            parent_updates = []
+
         if parent_updates:
             with transaction.atomic(using=using):
                 # If keeping the parents (upcasting) we need to update the relevant

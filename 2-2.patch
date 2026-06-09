@@ -1,0 +1,67 @@
+diff --git a/src/polymorphic/deletion.py b/src/polymorphic/deletion.py
+index 8cec00f..d78c5ba 100644
+--- a/src/polymorphic/deletion.py
++++ b/src/polymorphic/deletion.py
+@@ -47,6 +47,7 @@ class PolymorphicGuard:
+     """
+ 
+     action: Callable[..., Any]
++    lazy_sub_objs = True
+ 
+     def __init__(self, action: Callable[..., Any]) -> None:
+         if not callable(action):
+@@ -78,6 +79,10 @@ class PolymorphicGuard:
+         """
+         if isinstance(sub_objs, PolymorphicQuerySet) and not sub_objs.polymorphic_disabled:
+             sub_objs = sub_objs.non_polymorphic()
++            
++        if not getattr(self.action, "lazy_sub_objs", False) and not sub_objs:
++            return
++            
+         self.action(collector, field, sub_objs, using)
+ 
+     @cached_property
+diff --git a/src/polymorphic/tests/deletion/test_deletion.py b/src/polymorphic/tests/deletion/test_deletion.py
+index f7844fb..9cf9c19 100644
+--- a/src/polymorphic/tests/deletion/test_deletion.py
++++ b/src/polymorphic/tests/deletion/test_deletion.py
+@@ -244,6 +244,39 @@ class TestDeletion(TestCase):
+         assert TextAnswer.objects.count() == 0
+         assert YesNoAnswer.objects.count() == 0
+ 
++    def test_deep_inheritance_deletion(self):
++        """
++        Test that deeply inherited models are correctly deleted without IntegrityError
++        and without leaving partial inheritance chains behind.
++        """
++        from .models import A_274, B_274, C_274, D_274, E_274
++
++        b = B_274.objects.create()
++        d = D_274.objects.create()
++        e = E_274.objects.create()
++        c = C_274.objects.create()
++
++        # Poly queries still work
++        assert len(A_274.objects.all()) == 4
++        
++        # Test normal deletion
++        b.delete()
++        assert A_274.objects.count() == 3
++        
++        # Test keep_parents=True (indirectly checking keep_parents behaves correctly)
++        e.delete(keep_parents=True)
++        assert E_274.objects.count() == 0
++        assert D_274.objects.count() == 2 # D_274 instances: d, plus the base of e
++        
++        # Test full chain delete
++        A_274.objects.all().delete()
++
++        assert A_274.objects.count() == 0
++        assert B_274.objects.count() == 0
++        assert C_274.objects.count() == 0
++        assert D_274.objects.count() == 0
++        assert E_274.objects.count() == 0
++
+     def test_vanilla_deletion(self):
+         """
+         Test Django's vanilla multi table inheritance deletion and signaling.

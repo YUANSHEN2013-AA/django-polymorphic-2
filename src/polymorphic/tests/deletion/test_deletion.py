@@ -244,6 +244,39 @@ class TestDeletion(TestCase):
         assert TextAnswer.objects.count() == 0
         assert YesNoAnswer.objects.count() == 0
 
+    def test_deep_inheritance_deletion(self):
+        """
+        Test that deeply inherited models are correctly deleted without IntegrityError
+        and without leaving partial inheritance chains behind.
+        """
+        from .models import A_274, B_274, C_274, D_274, E_274
+
+        b = B_274.objects.create()
+        d = D_274.objects.create()
+        e = E_274.objects.create()
+        c = C_274.objects.create()
+
+        # Poly queries still work
+        assert len(A_274.objects.all()) == 4
+        
+        # Test normal deletion
+        b.delete()
+        assert A_274.objects.count() == 3
+        
+        # Test keep_parents=True (indirectly checking keep_parents behaves correctly)
+        e.delete(keep_parents=True)
+        assert E_274.objects.count() == 0
+        assert D_274.objects.count() == 2 # D_274 instances: d, plus the base of e
+        
+        # Test full chain delete
+        A_274.objects.all().delete()
+
+        assert A_274.objects.count() == 0
+        assert B_274.objects.count() == 0
+        assert C_274.objects.count() == 0
+        assert D_274.objects.count() == 0
+        assert E_274.objects.count() == 0
+
     def test_vanilla_deletion(self):
         """
         Test Django's vanilla multi table inheritance deletion and signaling.

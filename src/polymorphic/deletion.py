@@ -47,6 +47,7 @@ class PolymorphicGuard:
     """
 
     action: Callable[..., Any]
+    lazy_sub_objs = True
 
     def __init__(self, action: Callable[..., Any]) -> None:
         if not callable(action):
@@ -78,6 +79,10 @@ class PolymorphicGuard:
         """
         if isinstance(sub_objs, PolymorphicQuerySet) and not sub_objs.polymorphic_disabled:
             sub_objs = sub_objs.non_polymorphic()
+            
+        if not getattr(self.action, "lazy_sub_objs", False) and not sub_objs:
+            return
+            
         self.action(collector, field, sub_objs, using)
 
     @cached_property

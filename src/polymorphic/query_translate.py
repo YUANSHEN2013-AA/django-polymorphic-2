@@ -65,8 +65,7 @@ def translate_polymorphic_Q_object(
 ) -> Q:
     def tree_node_correct_field_specs(my_model: type[models.Model], node: Q) -> Q:
         "process all children of this Q node"
-        cpy = copy.copy(node)
-        cpy.children = []
+        result = None
         for child in node.children:
             if isinstance(child, (tuple, list)):
                 # this Q object child is a tuple => a kwarg like Q( instance_of=ModelB )
@@ -74,13 +73,33 @@ def translate_polymorphic_Q_object(
                 new_expr = _translate_polymorphic_filter_definition(
                     my_model, key, val, using=using
                 )
-                cpy.children.append(new_expr or child)
+                if new_expr is None:
+                    new_expr = node.__class__((key, val))
+                elif isinstance(new_expr, tuple):
+                    new_expr = node.__class__((new_expr[0], new_expr[1]))
             elif isinstance(child, models.Q):
                 # this Q object child is another Q object, recursively process
-                cpy.children.append(tree_node_correct_field_specs(my_model, child))
+                new_expr = tree_node_correct_field_specs(my_model, child)
             else:
-                cpy.children.append(child)
-        return cpy
+                new_expr = node.__class__(child)
+
+            if result is None:
+                result = new_expr
+            else:
+                if node.connector == node.__class__.OR:
+                    result |= new_expr
+                elif getattr(node.__class__, "XOR", None) and node.connector == getattr(node.__class__, "XOR"):
+                    result ^= new_expr
+                else:
+                    result &= new_expr
+
+        if result is None:
+            result = node.__class__()
+
+        if node.negated:
+            result = ~result
+
+        return result
 
     if isinstance(potential_q_object, models.Q):
         return tree_node_correct_field_specs(queryset_model, potential_q_object)
@@ -133,7 +152,12 @@ def _translate_polymorphic_filter_definition(
 
     # filter expression contains '___' (i.e. filter for polymorphic field)
     # => get the model class specified in the filter expression
-    newpath = translate_polymorphic_field_path(queryset_model, field_path)
+    newpath = field_path
+    while "___" in newpath:
+        translated = translate_polymorphic_field_path(queryset_model, newpath)
+        if translated == newpath:
+            break
+        newpath = translated
     return (newpath, field_val)
 
 
@@ -156,17 +180,32 @@ def translate_polymorphic_field_path(queryset_model: type[models.Model], field_p
         negated = True
         classname = classname.lstrip("-")
 
+    relation_prefix = ""
+    current_model = queryset_model
+
     if "__" in classname:
         # the user has app label prepended to class name via __ => use Django's get_model function
-        appname, sep, classname = classname.partition("__")
+        # OR the user has a relation path, e.g. relation__ModelC
+        appname, sep, cname = classname.partition("__")
+        model = None
         try:
-            model = apps.get_model(appname, classname)
-        except LookupError as le:
-            raise FieldError(f"Model {appname}.{classname} does not exist") from le
-        if not issubclass(model, queryset_model):
-            raise FieldError(
-                f"{model._meta.label} is not derived from {queryset_model._meta.label}"
-            )
+            model_candidate = apps.get_model(appname, cname)
+            if issubclass(model_candidate, queryset_model):
+                model = model_candidate
+        except LookupError:
+            pass
+
+        if model is None:
+            # Maybe it's a relation path!
+            relation_path, sep, cname = classname.rpartition("__")
+            try:
+                for part in relation_path.split("__"):
+                    field = current_model._meta.get_field(part)
+                    current_model = field.related_model
+                model = _map_queryname_to_class(current_model, cname)
+                relation_prefix = relation_path + "__"
+            except (FieldDoesNotExist, AttributeError) as e:
+                raise FieldError(f"Model {appname}.{cname} does not exist and '{classname}' is not a valid relation path") from e
 
     else:
         # the user has only given us the class name via ___
@@ -187,12 +226,15 @@ def translate_polymorphic_field_path(queryset_model: type[models.Model], field_p
 
         model = _map_queryname_to_class(queryset_model, classname)
 
-    basepath = _create_base_path(queryset_model, model)
+    basepath = _create_base_path(current_model, model)
 
     if negated:
         newpath = "-"
     else:
         newpath = ""
+
+    if relation_prefix:
+        newpath += relation_prefix
 
     newpath += basepath
     if basepath:

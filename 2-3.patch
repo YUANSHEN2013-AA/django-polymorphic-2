@@ -1,0 +1,97 @@
+diff --git a/src/polymorphic/query.py b/src/polymorphic/query.py
+index 7d55bd5..2872446 100644
+--- a/src/polymorphic/query.py
++++ b/src/polymorphic/query.py
+@@ -697,5 +697,17 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
+         mechanism is already walking the class hierarchy and producing a correct
+         deletion graph. Introducing polymorphic querysets into the deletion process
+         disrupts the model hierarchy/relationship traversal.
++
++        We also temporarily patch ``Collector.related_objects`` to ensure that any
++        related-object querysets produced during deletion are non-polymorphic. This
++        is necessary because Django's Collector uses ``_base_manager`` internally,
++        and for polymorphic models this returns a ``PolymorphicManager``. If
++        polymorphic querysets leak into the Collector's ``collect()`` phase,
++        objects are resolved to their concrete types, which can cause intermediate
++        parent models in multi-level (>=3) inheritance chains to be missed from the
++        deletion graph, leaving residual records in the database.
+         """
+-        return QuerySet.delete(self.non_polymorphic())
++        from django.db.models.deletion import Collector as DjangoCollector
++
++        with _polymorphic_deletion_context():
++            return QuerySet.delete(self.non_polymorphic())
+diff --git a/src/polymorphic/tests/deletion/models.py b/src/polymorphic/tests/deletion/models.py
+index d9ac68e..b01591f 100644
+--- a/src/polymorphic/tests/deletion/models.py
++++ b/src/polymorphic/tests/deletion/models.py
+@@ -330,6 +330,27 @@ class C_274(B_274):
+     pass
+ 
+ 
++###########################################################
++# Three-level inheritance reproduction case for deletion bug
++# This reproduces the issue where residual records remain in the database
++# after deletion with three or more levels of polymorphic inheritance.
++
++class Level1(PolymorphicModel):
++    pass
++
++
++class Level2(Level1):
++    pass
++
++
++class Level3(Level2):
++    data = models.CharField(max_length=100, default="")
++
++
++class Level4(Level3):
++    extra_data = models.CharField(max_length=100, default="")
++
++
+ ###########################################################
+ ###########################################################
+ # https://github.com/jazzband/django-polymorphic/issues/357
+diff --git a/src/polymorphic/tests/deletion/test_deletion.py b/src/polymorphic/tests/deletion/test_deletion.py
+index f7844fb..b432838 100644
+--- a/src/polymorphic/tests/deletion/test_deletion.py
++++ b/src/polymorphic/tests/deletion/test_deletion.py
+@@ -813,3 +813,37 @@ class TestDeletion(TestCase):
+         assert Normal3.objects.count() == 4
+         assert Normal3.objects.get(pk=b1_pk).__class__ is Normal3
+         assert not Poly3.objects.filter(pk=b1_pk).exists()
++
++    def test_polymorphic_deletion_three_level(self):
++        """
++        Test deletion with three levels of polymorphic inheritance.
++        This reproduces the issue where residual records remain in the database
++        when using PostgreSQL with three or more inheritance levels.
++        """
++        from .models import Level1, Level2, Level3
++
++        level3 = Level3.objects.create(data="test")
++        level3_pk = level3.pk
++
++        Level1.objects.filter(pk=level3_pk).delete()
++
++        assert Level1.objects.count() == 0
++        assert Level2.objects.count() == 0
++        assert Level3.objects.count() == 0
++
++    def test_polymorphic_deletion_four_level(self):
++        """
++        Test deletion with four levels of polymorphic inheritance.
++        This ensures the fix works with deeper inheritance hierarchies.
++        """
++        from .models import Level1, Level2, Level3, Level4
++
++        level4 = Level4.objects.create(data="test", extra_data="extra")
++        level4_pk = level4.pk
++
++        Level1.objects.filter(pk=level4_pk).delete()
++
++        assert Level1.objects.count() == 0
++        assert Level2.objects.count() == 0
++        assert Level3.objects.count() == 0
++        assert Level4.objects.count() == 0

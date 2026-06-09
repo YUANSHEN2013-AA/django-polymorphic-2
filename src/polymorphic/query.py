@@ -697,5 +697,17 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         mechanism is already walking the class hierarchy and producing a correct
         deletion graph. Introducing polymorphic querysets into the deletion process
         disrupts the model hierarchy/relationship traversal.
+
+        We also temporarily patch ``Collector.related_objects`` to ensure that any
+        related-object querysets produced during deletion are non-polymorphic. This
+        is necessary because Django's Collector uses ``_base_manager`` internally,
+        and for polymorphic models this returns a ``PolymorphicManager``. If
+        polymorphic querysets leak into the Collector's ``collect()`` phase,
+        objects are resolved to their concrete types, which can cause intermediate
+        parent models in multi-level (>=3) inheritance chains to be missed from the
+        deletion graph, leaving residual records in the database.
         """
-        return QuerySet.delete(self.non_polymorphic())
+        from django.db.models.deletion import Collector as DjangoCollector
+
+        with _polymorphic_deletion_context():
+            return QuerySet.delete(self.non_polymorphic())

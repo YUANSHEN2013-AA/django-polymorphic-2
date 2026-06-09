@@ -813,3 +813,37 @@ class TestDeletion(TestCase):
         assert Normal3.objects.count() == 4
         assert Normal3.objects.get(pk=b1_pk).__class__ is Normal3
         assert not Poly3.objects.filter(pk=b1_pk).exists()
+
+    def test_polymorphic_deletion_three_level(self):
+        """
+        Test deletion with three levels of polymorphic inheritance.
+        This reproduces the issue where residual records remain in the database
+        when using PostgreSQL with three or more inheritance levels.
+        """
+        from .models import Level1, Level2, Level3
+
+        level3 = Level3.objects.create(data="test")
+        level3_pk = level3.pk
+
+        Level1.objects.filter(pk=level3_pk).delete()
+
+        assert Level1.objects.count() == 0
+        assert Level2.objects.count() == 0
+        assert Level3.objects.count() == 0
+
+    def test_polymorphic_deletion_four_level(self):
+        """
+        Test deletion with four levels of polymorphic inheritance.
+        This ensures the fix works with deeper inheritance hierarchies.
+        """
+        from .models import Level1, Level2, Level3, Level4
+
+        level4 = Level4.objects.create(data="test", extra_data="extra")
+        level4_pk = level4.pk
+
+        Level1.objects.filter(pk=level4_pk).delete()
+
+        assert Level1.objects.count() == 0
+        assert Level2.objects.count() == 0
+        assert Level3.objects.count() == 0
+        assert Level4.objects.count() == 0

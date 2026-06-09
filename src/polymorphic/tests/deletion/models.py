@@ -331,6 +331,27 @@ class C_274(B_274):
 
 
 ###########################################################
+# Three-level inheritance reproduction case for deletion bug
+# This reproduces the issue where residual records remain in the database
+# after deletion with three or more levels of polymorphic inheritance.
+
+class Level1(PolymorphicModel):
+    pass
+
+
+class Level2(Level1):
+    pass
+
+
+class Level3(Level2):
+    data = models.CharField(max_length=100, default="")
+
+
+class Level4(Level3):
+    extra_data = models.CharField(max_length=100, default="")
+
+
+###########################################################
 ###########################################################
 # https://github.com/jazzband/django-polymorphic/issues/357
 

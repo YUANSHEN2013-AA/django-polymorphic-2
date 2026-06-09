@@ -3,7 +3,8 @@ PolymorphicQuerySet support functions
 """
 
 import copy
-from functools import reduce
+from collections import defaultdict
+from functools import lru_cache, reduce
 from operator import or_
 from typing import Any
 
@@ -15,15 +16,7 @@ from django.db.models import Q, Subquery
 from django.db.models.fields.related import ForeignObjectRel, RelatedField
 from django.db.utils import DEFAULT_DB_ALIAS
 
-from .utils import _lazy_ctype, _map_queryname_to_class, concrete_descendants
-
-# These functions implement the additional filter- and Q-object functionality.
-# They form a kind of small framework for easily adding more
-# functionality to filters and Q objects.
-# Probably a more general queryset enhancement class could be made out of them.
-
-###################################################################################
-# PolymorphicQuerySet support functions
+from .utils import _lazy_ctype, concrete_descendants
 
 
 def translate_polymorphic_filter_definitions_in_kwargs(
@@ -43,16 +36,14 @@ def translate_polymorphic_filter_definitions_in_kwargs(
     Returns: a list of non-keyword-arguments (Q objects) to be added to the filter() query.
     """
     additional_args = []
-    for field_path, val in kwargs.copy().items():  # `copy` so we're not mutating the dict
+    for field_path, val in kwargs.copy().items():
         new_expr = _translate_polymorphic_filter_definition(
             queryset_model, field_path, val, using=using
         )
 
         if isinstance(new_expr, tuple):
-            # replace kwargs element
             del kwargs[field_path]
             kwargs[new_expr[0]] = new_expr[1]
-
         elif isinstance(new_expr, models.Q):
             del kwargs[field_path]
             additional_args.append(new_expr)
@@ -63,29 +54,39 @@ def translate_polymorphic_filter_definitions_in_kwargs(
 def translate_polymorphic_Q_object(
     queryset_model: type[models.Model], potential_q_object: Q, using: str = DEFAULT_DB_ALIAS
 ) -> Q:
-    def tree_node_correct_field_specs(my_model: type[models.Model], node: Q) -> Q:
-        "process all children of this Q node"
-        cpy = copy.copy(node)
-        cpy.children = []
-        for child in node.children:
-            if isinstance(child, (tuple, list)):
-                # this Q object child is a tuple => a kwarg like Q( instance_of=ModelB )
-                key, val = child
-                new_expr = _translate_polymorphic_filter_definition(
-                    my_model, key, val, using=using
-                )
-                cpy.children.append(new_expr or child)
-            elif isinstance(child, models.Q):
-                # this Q object child is another Q object, recursively process
-                cpy.children.append(tree_node_correct_field_specs(my_model, child))
-            else:
-                cpy.children.append(child)
-        return cpy
-
     if isinstance(potential_q_object, models.Q):
-        return tree_node_correct_field_specs(queryset_model, potential_q_object)
+        return _translate_polymorphic_q_node(queryset_model, potential_q_object, using=using)
 
     return potential_q_object  # type: ignore[unreachable]
+
+
+def _translate_polymorphic_q_node(
+    queryset_model: type[models.Model], node: Q, using: str = DEFAULT_DB_ALIAS
+) -> Q:
+    translated_node = copy.copy(node)
+    translated_node.children = [
+        _translate_polymorphic_q_child(queryset_model, child, using=using)
+        for child in node.children
+    ]
+    return translated_node
+
+
+def _translate_polymorphic_q_child(
+    queryset_model: type[models.Model], child: Any, using: str = DEFAULT_DB_ALIAS
+) -> Any:
+    if isinstance(child, models.Q):
+        return _translate_polymorphic_q_node(queryset_model, child, using=using)
+
+    if isinstance(child, (tuple, list)) and len(child) == 2 and isinstance(child[0], str):
+        key, val = child
+        translated_child = _translate_polymorphic_filter_definition(
+            queryset_model, key, val, using=using
+        )
+        if translated_child is None:
+            return child
+        return translated_child
+
+    return child
 
 
 def translate_polymorphic_filter_definitions_in_args(
@@ -96,8 +97,7 @@ def translate_polymorphic_filter_definitions_in_args(
 
     In the args list, we return all kwargs to Q-objects that contain special
     polymorphic functionality with their vanilla django equivalents.
-    We traverse the Q object tree for this (which is simple).
-
+    We traverse the Q object tree for this.
 
     Returns: modified Q objects
     """
@@ -121,20 +121,14 @@ def _translate_polymorphic_filter_definition(
 
     Returns: kwarg tuple or Q object or None (if no change is required)
     """
-
-    # handle instance_of expressions or alternatively,
-    # if this is a normal Django filter expression, return None
     if field_path == "instance_of":
         return create_instanceof_q(field_val, using=using)
-    elif field_path == "not_instance_of":
+    if field_path == "not_instance_of":
         return create_instanceof_q(field_val, not_instance_of=True, using=using)
-    elif "___" not in field_path:
-        return None  # no change
+    if "___" not in field_path:
+        return None
 
-    # filter expression contains '___' (i.e. filter for polymorphic field)
-    # => get the model class specified in the filter expression
-    newpath = translate_polymorphic_field_path(queryset_model, field_path)
-    return (newpath, field_val)
+    return (translate_polymorphic_field_path(queryset_model, field_path), field_val)
 
 
 def translate_polymorphic_field_path(queryset_model: type[models.Model], field_path: str) -> str:
@@ -157,64 +151,107 @@ def translate_polymorphic_field_path(queryset_model: type[models.Model], field_p
         classname = classname.lstrip("-")
 
     if "__" in classname:
-        # the user has app label prepended to class name via __ => use Django's get_model function
-        appname, sep, classname = classname.partition("__")
-        try:
-            model = apps.get_model(appname, classname)
-        except LookupError as le:
-            raise FieldError(f"Model {appname}.{classname} does not exist") from le
-        if not issubclass(model, queryset_model):
-            raise FieldError(
-                f"{model._meta.label} is not derived from {queryset_model._meta.label}"
-            )
-
+        appname, _, model_name = classname.partition("__")
+        model = _get_query_lookup_model_from_app_label(queryset_model, appname, model_name)
     else:
-        # the user has only given us the class name via ___
-        # => select the model from the sub models of the queryset base model
-
-        # Test whether it's actually a regular relation__ _fieldname (the field starting with an _)
-        # so no tripple ClassName___field was intended.
-        try:
-            # This also retreives M2M relations now (including reverse foreign key relations)
-            field = queryset_model._meta.get_field(classname)
-
-            if isinstance(field, (RelatedField, ForeignObjectRel)):
-                # Can also test whether the field exists in the related object to avoid ambiguity between
-                # class names and field names, but that never happens when your class names are in CamelCase.
-                return field_path  # No exception raised, field does exist.
-        except FieldDoesNotExist:
-            pass
-
-        model = _map_queryname_to_class(queryset_model, classname)
+        if _is_relationship_field(queryset_model, classname):
+            return field_path
+        model = _get_query_lookup_model(queryset_model, classname)
 
     basepath = _create_base_path(queryset_model, model)
-
-    if negated:
-        newpath = "-"
-    else:
-        newpath = ""
-
-    newpath += basepath
+    newpath = "-" if negated else ""
     if basepath:
-        newpath += "__"
-
-    newpath += pure_field_path
+        newpath += f"{basepath}__{pure_field_path}"
+    else:
+        newpath += pure_field_path
     return newpath
 
 
+@lru_cache(maxsize=None)
+def _get_query_lookup_models(queryset_model: type[models.Model]) -> tuple[type[models.Model], ...]:
+    result: list[type[models.Model]] = []
+    seen: set[type[models.Model]] = set()
+
+    for model in queryset_model.mro():
+        if not isinstance(model, type) or not issubclass(model, models.Model):
+            continue
+        if model is models.Model:
+            continue
+        if model not in seen:
+            seen.add(model)
+            result.append(model)
+
+    for model in concrete_descendants(queryset_model, include_proxy=True):
+        if model not in seen:
+            seen.add(model)
+            result.append(model)
+
+    return tuple(result)
+
+
+def _get_query_lookup_model(
+    queryset_model: type[models.Model], model_name: str
+) -> type[models.Model]:
+    matches: dict[str, list[type[models.Model]]] = defaultdict(list)
+    for model in _get_query_lookup_models(queryset_model):
+        matches[model.__name__.lower()].append(model)
+
+    matched_models = matches.get(model_name.lower(), [])
+    if len(matched_models) == 1:
+        return matched_models[0]
+    if len(matched_models) > 1:
+        raise FieldError(
+            f"{model_name} could refer to any of {[m._meta.label for m in matched_models]}. In "
+            f"this case, please use the syntax: applabel__ModelName___field"
+        )
+
+    raise AssertionError(f"{model_name} is not a subclass of {queryset_model._meta.label}")
+
+
+def _get_query_lookup_model_from_app_label(
+    queryset_model: type[models.Model], appname: str, model_name: str
+) -> type[models.Model]:
+    try:
+        model = apps.get_model(appname, model_name)
+    except LookupError as exc:
+        raise FieldError(f"Model {appname}.{model_name} does not exist") from exc
+
+    if issubclass(model, queryset_model) or issubclass(queryset_model, model):
+        return model
+
+    raise FieldError(f"{model._meta.label} is not derived from {queryset_model._meta.label}")
+
+
+def _is_relationship_field(queryset_model: type[models.Model], field_name: str) -> bool:
+    try:
+        field = queryset_model._meta.get_field(field_name)
+    except FieldDoesNotExist:
+        return False
+
+    return isinstance(field, (RelatedField, ForeignObjectRel))
+
+
 def _create_base_path(baseclass: type[models.Model], myclass: type[models.Model]) -> str:
-    # create new field path for expressions, e.g. for baseclass=ModelA, myclass=ModelC
-    # 'modelb__modelc" is returned
-    for b in myclass.__bases__:
-        if b == baseclass:
+    if baseclass is myclass or issubclass(baseclass, myclass):
+        return ""
+    if issubclass(myclass, baseclass):
+        return _create_descendant_base_path(baseclass, myclass)
+    return ""
+
+
+def _create_descendant_base_path(baseclass: type[models.Model], myclass: type[models.Model]) -> str:
+    for base in myclass.__bases__:
+        if not isinstance(base, type) or not issubclass(base, models.Model):
+            continue
+
+        if base == baseclass:
             return _get_query_related_name(myclass)
 
-        path = _create_base_path(baseclass, b)
+        path = _create_descendant_base_path(baseclass, base)
         if path:
-            if b._meta.abstract or b._meta.proxy:  # type: ignore[attr-defined]
+            if base._meta.abstract or base._meta.proxy:  # type: ignore[attr-defined]
                 return _get_query_related_name(myclass)
-            else:
-                return f"{path}__{_get_query_related_name(myclass)}"
+            return f"{path}__{_get_query_related_name(myclass)}"
     return ""
 
 
@@ -223,8 +260,6 @@ def _get_query_related_name(myclass: type[models.Model]) -> str:
         if isinstance(f, models.OneToOneField) and f.remote_field.parent_link:
             return f.related_query_name()
 
-    # Fallback to undetected name,
-    # this happens on proxy models (e.g. SubclassSelectorProxyModel)
     return myclass.__name__.lower()
 
 
@@ -263,7 +298,6 @@ def create_instanceof_q(
     if lazy_cts:
         q |= Q(
             polymorphic_ctype__in=Subquery(
-                # no need to pass using here
                 ContentType.objects.filter(reduce(or_, lazy_cts)).values("pk")
             )
         )

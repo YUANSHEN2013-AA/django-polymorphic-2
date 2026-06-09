@@ -1,61 +1,38 @@
 import copy
-import tempfile
 import pickle
+import tempfile
 import threading
 
 from django.db.models import Q
 from django.test import TestCase
 
-from polymorphic.tests.models import Bottom, Middle, Top
-from polymorphic.query_translate import translate_polymorphic_filter_definitions_in_args
+from polymorphic.query_translate import (
+    translate_polymorphic_Q_object,
+    translate_polymorphic_field_path,
+    translate_polymorphic_filter_definitions_in_args,
+)
+from polymorphic.tests.models import Bottom, DeepCopyTester, DeepCopyTester2, Model2A, Model2B, Model2C, Model2D
 
 
 class QueryTranslateTests(TestCase):
+    def create_model2_chain_with_overlap(self):
+        a = Model2A.objects.create(field1="shared")
+        b = Model2B.objects.create(field1="shared", field2="match-b")
+        c = Model2C.objects.create(field1="shared", field2="match-c", field3="match-c3")
+        d = Model2D.objects.create(field1="shared", field2="match-b", field3="match-c3", field4="match-d4")
+        return a, b, c, d
+
     def test_translate_with_not_pickleable_query(self):
-        """
-        In some cases, Django may attacha _thread object to the query and we
-        will get the following when we try to deepcopy inside of
-        translate_polymorphic_filter_definitions_in_args:
-
-            TypeError: cannot pickle '_thread.lock' object
-
-
-        For this to trigger, we need to somehoe go down this path:
-
-                File "/perfdash/.venv/lib64/python3.12/site-packages/polymorphic/query_translate.py", line 95, in translate_polymorphic_filter_definitions_in_args
-            translate_polymorphic_Q_object(queryset_model, copy.deepcopy(q), using=using) for q in args
-                                                        ^^^^^^^^^^^^^^^^
-        File "/usr/lib64/python3.12/copy.py", line 143, in deepcopy
-            y = copier(memo)
-                ^^^^^^^^^^^^
-        File "/perfdash/.venv/lib64/python3.12/site-packages/django/utils/tree.py", line 53, in __deepcopy__
-            obj.children = copy.deepcopy(self.children, memodict)
-                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        File "/usr/lib64/python3.12/copy.py", line 136, in deepcopy
-            y = copier(x, memo)
-                ^^^^^^^^^^^^^^^
-
-        Internals in Django, somehow we must trigger this tree.py code in django via
-        the deepcopy in order to trigger this.
-
-        """
-
         with tempfile.TemporaryFile() as fd:
-            # verify this is definitely not pickleable
             with self.assertRaises(TypeError):
                 pickle.dumps(threading.Lock())
 
-            # I know this doesn't make sense to pass as a Q(), but
-            # I haven't found another way to trigger the copy.deepcopy failing.
             q = Q(blog__info="blog info") | Q(blog__info=threading.Lock())
 
             translate_polymorphic_filter_definitions_in_args(Bottom, args=[q])
 
     def test_deep_copy_of_q_objects(self):
         import os
-        from polymorphic.tests.models import DeepCopyTester, DeepCopyTester2
-        # binary fields can have an unpickleable memoryview object in them
-        # see https://github.com/jazzband/django-polymorphic/issues/524
 
         d1_bf = os.urandom(32)
         d2_bf1 = os.urandom(32)
@@ -79,14 +56,66 @@ class QueryTranslateTests(TestCase):
         self.assertEqual(DeepCopyTester.objects.count(), 0)
 
     def test_proxy_model_query_related_name(self):
-        """Test _get_query_related_name fallback for proxy models"""
         from polymorphic.query_translate import _get_query_related_name
         from polymorphic.tests.models import ProxyChild, SubclassSelectorProxyModel
 
-        # Test that proxy models use the fallback (lowercase class name)
-        # since they don't have a OneToOneField parent link
         result = _get_query_related_name(ProxyChild)
         assert result == "proxychild"
 
         result = _get_query_related_name(SubclassSelectorProxyModel)
         assert result == "subclassselectorproxymodel"
+
+    def test_translate_polymorphic_q_object_supports_nested_boolean_connectors(self):
+        q_object = Q(Model2A___field1="shared") & (
+            Q(Model2B___field2="match-b") ^ Q(Model2D___field4="match-d4")
+        )
+        original_q_object = copy.deepcopy(q_object)
+
+        translated_q_object = translate_polymorphic_Q_object(Model2C, q_object)
+
+        assert q_object.children == original_q_object.children
+        assert translated_q_object.connector == Q.AND
+        assert translated_q_object.children[0][0] == "field1"
+        assert translated_q_object.children[1].connector == Q.XOR
+        assert translated_q_object.children[1].children[0][0] == "field2"
+        assert translated_q_object.children[1].children[1][0] == "model2d__field4"
+
+    def test_translate_polymorphic_field_path_supports_cross_inheritance_levels(self):
+        assert translate_polymorphic_field_path(Model2C, "Model2A___field1") == "field1"
+        assert translate_polymorphic_field_path(Model2B, "Model2D___field4") == "model2c__model2d__field4"
+        assert translate_polymorphic_field_path(Model2D, "tests__Model2B___field2") == "field2"
+
+    def test_filter_supports_nested_boolean_q_expressions(self):
+        _, _, _, d = self.create_model2_chain_with_overlap()
+
+        results = list(
+            Model2A.objects.filter(
+                Q(Model2B___field2="match-b")
+                & (Q(Model2C___field3="match-c3") | Q(Model2D___field4="match-d4"))
+            ).order_by("pk")
+        )
+
+        assert results == [d]
+
+    def test_filter_supports_xor_q_expressions(self):
+        _, b, c, _ = self.create_model2_chain_with_overlap()
+
+        results = list(
+            Model2A.objects.filter(
+                Q(Model2B___field2="match-b") ^ Q(Model2C___field3="match-c3")
+            ).order_by("pk")
+        )
+
+        assert results == [b, c]
+
+    def test_filter_supports_cross_inheritance_field_filters(self):
+        _, _, c, d = self.create_model2_chain_with_overlap()
+
+        results = list(
+            Model2C.objects.filter(
+                Q(Model2A___field1="shared")
+                & (Q(Model2B___field2="match-c") | Q(Model2D___field4="match-d4"))
+            ).order_by("pk")
+        )
+
+        assert results == [c, d]

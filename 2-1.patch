@@ -1,0 +1,184 @@
+diff --git a/src/polymorphic/deletion.py b/src/polymorphic/deletion.py
+index 8cec00f..32aa916 100644
+--- a/src/polymorphic/deletion.py
++++ b/src/polymorphic/deletion.py
+@@ -4,7 +4,8 @@ Classes and utilities for handling deletions in polymorphic models.
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Callable
++from collections import OrderedDict
++from collections.abc import Callable, Iterable
+ from functools import cached_property
+ from typing import Any, cast
+ 
+@@ -12,6 +13,7 @@ from django.db import models
+ from django.db.migrations.serializer import BaseSerializer, serializer_factory
+ from django.db.migrations.writer import MigrationWriter
+ from django.db.models.deletion import Collector
++from django.db.models.query import QuerySet
+ 
+ from .query import PolymorphicQuerySet
+ 
+@@ -37,6 +39,32 @@ def migration_fingerprint(value: Any) -> Any:
+     return code
+ 
+ 
++def iter_homogeneous_deletion_batches(
++    sub_objs: QuerySet[Any] | Iterable[models.Model],
++) -> Iterable[QuerySet[Any] | list[models.Model]]:
++    if isinstance(sub_objs, PolymorphicQuerySet):
++        yield sub_objs.non_polymorphic() if not sub_objs.polymorphic_disabled else sub_objs
++        return
++
++    if isinstance(sub_objs, QuerySet):
++        yield sub_objs
++        return
++
++    materialized = list(sub_objs)
++    if not materialized:
++        return
++
++    first_model = materialized[0].__class__
++    if all(obj.__class__ is first_model for obj in materialized):
++        yield materialized
++        return
++
++    grouped: OrderedDict[type[models.Model], list[models.Model]] = OrderedDict()
++    for obj in materialized:
++        grouped.setdefault(obj.__class__, []).append(obj)
++    yield from grouped.values()
++
++
+ class PolymorphicGuard:
+     """
+     Wrap an :attr:`django.db.models.ForeignKey.on_delete` callable
+@@ -57,13 +85,14 @@ class PolymorphicGuard:
+         self,
+         collector: Collector,
+         field: models.Field[Any, Any],
+-        sub_objs: PolymorphicQuerySet[Any, Any],
++        sub_objs: QuerySet[Any] | Iterable[models.Model],
+         using: str,
+     ) -> None:
+         """
+         This guard wraps an on_delete action to ensure that any polymorphic queryset
+-        passed to it is converted to a non-polymorphic queryset before proceeding.
+-        This prevents issues with cascading deletes on polymorphic models.
++        passed to it is converted to a non-polymorphic queryset before proceeding
++        and that any already-materialized polymorphic collections are split into
++        homogeneous model batches before reaching Django's Collector.
+ 
+         This guard should be automatically applied to reverse relations such that
+ 
+@@ -76,9 +105,8 @@ class PolymorphicGuard:
+                 )
+ 
+         """
+-        if isinstance(sub_objs, PolymorphicQuerySet) and not sub_objs.polymorphic_disabled:
+-            sub_objs = sub_objs.non_polymorphic()
+-        self.action(collector, field, sub_objs, using)
++        for batch in iter_homogeneous_deletion_batches(sub_objs):
++            self.action(collector, field, batch, using)
+ 
+     @cached_property
+     def migration_key(self) -> Any:
+diff --git a/src/polymorphic/tests/deletion/test_deletion.py b/src/polymorphic/tests/deletion/test_deletion.py
+index f7844fb..e63d11c 100644
+--- a/src/polymorphic/tests/deletion/test_deletion.py
++++ b/src/polymorphic/tests/deletion/test_deletion.py
+@@ -1,11 +1,13 @@
+-from django.test import TestCase
+ import shutil
+ import tempfile
++
+ from django.contrib.auth import get_user_model
+ from django.core.files.base import ContentFile
+-from django.test.utils import CaptureQueriesContext
+-from django.test import override_settings
+ from django.db import connection
++from django.db.models.deletion import Collector
++from django.test import TestCase
++from django.test import override_settings
++from django.test.utils import CaptureQueriesContext
+ 
+ 
+ @override_settings()
+@@ -774,6 +776,77 @@ class TestDeletion(TestCase):
+         p1_fetched = Poly1.objects.non_polymorphic().get(pk=a1.pk)
+         assert p1_fetched.get_real_instance().__class__ is Poly1
+ 
++    def test_polymorphic_guard_splits_materialized_mixed_batches(self):
++        from .models import (
++            PolyDevice,
++            PolyEthernetInterface,
++            PolyInterface,
++            PolyModularInterface,
++            PolyWirelessInterface,
++        )
++
++        other_device = PolyDevice.objects.create(name="Device 2")
++        PolyWirelessInterface.objects.create(
++            name="Wireless0", device=other_device, wirelessy_stuff="wifi"
++        )
++
++        device = PolyDevice.objects.create(name="Device 1")
++        direct = PolyEthernetInterface.objects.create(
++            name="Eth0", device=device, ethernety_stuff="direct"
++        )
++        derived = PolyModularInterface.objects.create(
++            name="Modular0",
++            device=device,
++            ethernety_stuff="ethernet",
++            modular_stuff="module",
++        )
++
++        field = PolyInterface._meta.get_field("device")
++        sub_objs = list(
++            PolyInterface.objects.filter(pk__in=[direct.pk, derived.pk]).order_by("-pk")
++        )
++
++        collector = Collector(using=connection.alias)
++        field.remote_field.on_delete(
++            collector,
++            field,
++            sub_objs,
++            connection.alias,
++        )
++        collector.delete()
++
++        assert PolyInterface.objects.filter(device=device).count() == 0
++        assert PolyEthernetInterface.objects.filter(pk__in=[direct.pk, derived.pk]).count() == 0
++        assert PolyModularInterface.objects.filter(pk=derived.pk).count() == 0
++        remaining = list(PolyInterface.objects.order_by("pk"))
++        assert len(remaining) == 1
++        assert isinstance(remaining[0], PolyWirelessInterface)
++
++    def test_plain_model_delete_unchanged(self):
++        from .models import Base, Child, GrandChild
++
++        grand_child = GrandChild.objects.create()
++
++        grand_child.delete()
++
++        assert Base.objects.count() == 0
++        assert Child.objects.count() == 0
++        assert GrandChild.objects.count() == 0
++
++    def test_keep_parents_false_unchanged_for_polymorphic_delete(self):
++        from polymorphic.tests.test_migrations.models import (
++            BasePolyModel,
++            ChildPolyModel,
++            GrandChildPolyModel,
++        )
++
++        obj = GrandChildPolyModel.objects.create(name="base", description="child", extra_info="leaf")
++        obj.delete(keep_parents=False)
++
++        assert BasePolyModel.objects.count() == 0
++        assert ChildPolyModel.objects.count() == 0
++        assert GrandChildPolyModel.objects.count() == 0
++
+     def test_delete_keep_parents(self):
+         """
+         Test that delete(keep_parents=True) works as expected in polymorphic models

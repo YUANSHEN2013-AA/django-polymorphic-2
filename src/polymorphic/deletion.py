@@ -4,7 +4,8 @@ Classes and utilities for handling deletions in polymorphic models.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from functools import cached_property
 from typing import Any, cast
 
@@ -12,6 +13,7 @@ from django.db import models
 from django.db.migrations.serializer import BaseSerializer, serializer_factory
 from django.db.migrations.writer import MigrationWriter
 from django.db.models.deletion import Collector
+from django.db.models.query import QuerySet
 
 from .query import PolymorphicQuerySet
 
@@ -37,6 +39,32 @@ def migration_fingerprint(value: Any) -> Any:
     return code
 
 
+def iter_homogeneous_deletion_batches(
+    sub_objs: QuerySet[Any] | Iterable[models.Model],
+) -> Iterable[QuerySet[Any] | list[models.Model]]:
+    if isinstance(sub_objs, PolymorphicQuerySet):
+        yield sub_objs.non_polymorphic() if not sub_objs.polymorphic_disabled else sub_objs
+        return
+
+    if isinstance(sub_objs, QuerySet):
+        yield sub_objs
+        return
+
+    materialized = list(sub_objs)
+    if not materialized:
+        return
+
+    first_model = materialized[0].__class__
+    if all(obj.__class__ is first_model for obj in materialized):
+        yield materialized
+        return
+
+    grouped: OrderedDict[type[models.Model], list[models.Model]] = OrderedDict()
+    for obj in materialized:
+        grouped.setdefault(obj.__class__, []).append(obj)
+    yield from grouped.values()
+
+
 class PolymorphicGuard:
     """
     Wrap an :attr:`django.db.models.ForeignKey.on_delete` callable
@@ -57,13 +85,14 @@ class PolymorphicGuard:
         self,
         collector: Collector,
         field: models.Field[Any, Any],
-        sub_objs: PolymorphicQuerySet[Any, Any],
+        sub_objs: QuerySet[Any] | Iterable[models.Model],
         using: str,
     ) -> None:
         """
         This guard wraps an on_delete action to ensure that any polymorphic queryset
-        passed to it is converted to a non-polymorphic queryset before proceeding.
-        This prevents issues with cascading deletes on polymorphic models.
+        passed to it is converted to a non-polymorphic queryset before proceeding
+        and that any already-materialized polymorphic collections are split into
+        homogeneous model batches before reaching Django's Collector.
 
         This guard should be automatically applied to reverse relations such that
 
@@ -76,9 +105,8 @@ class PolymorphicGuard:
                 )
 
         """
-        if isinstance(sub_objs, PolymorphicQuerySet) and not sub_objs.polymorphic_disabled:
-            sub_objs = sub_objs.non_polymorphic()
-        self.action(collector, field, sub_objs, using)
+        for batch in iter_homogeneous_deletion_batches(sub_objs):
+            self.action(collector, field, batch, using)
 
     @cached_property
     def migration_key(self) -> Any:

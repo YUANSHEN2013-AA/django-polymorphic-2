@@ -1,11 +1,13 @@
-from django.test import TestCase
 import shutil
 import tempfile
+
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
-from django.test.utils import CaptureQueriesContext
-from django.test import override_settings
 from django.db import connection
+from django.db.models.deletion import Collector
+from django.test import TestCase
+from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 
 
 @override_settings()
@@ -773,6 +775,77 @@ class TestDeletion(TestCase):
 
         p1_fetched = Poly1.objects.non_polymorphic().get(pk=a1.pk)
         assert p1_fetched.get_real_instance().__class__ is Poly1
+
+    def test_polymorphic_guard_splits_materialized_mixed_batches(self):
+        from .models import (
+            PolyDevice,
+            PolyEthernetInterface,
+            PolyInterface,
+            PolyModularInterface,
+            PolyWirelessInterface,
+        )
+
+        other_device = PolyDevice.objects.create(name="Device 2")
+        PolyWirelessInterface.objects.create(
+            name="Wireless0", device=other_device, wirelessy_stuff="wifi"
+        )
+
+        device = PolyDevice.objects.create(name="Device 1")
+        direct = PolyEthernetInterface.objects.create(
+            name="Eth0", device=device, ethernety_stuff="direct"
+        )
+        derived = PolyModularInterface.objects.create(
+            name="Modular0",
+            device=device,
+            ethernety_stuff="ethernet",
+            modular_stuff="module",
+        )
+
+        field = PolyInterface._meta.get_field("device")
+        sub_objs = list(
+            PolyInterface.objects.filter(pk__in=[direct.pk, derived.pk]).order_by("-pk")
+        )
+
+        collector = Collector(using=connection.alias)
+        field.remote_field.on_delete(
+            collector,
+            field,
+            sub_objs,
+            connection.alias,
+        )
+        collector.delete()
+
+        assert PolyInterface.objects.filter(device=device).count() == 0
+        assert PolyEthernetInterface.objects.filter(pk__in=[direct.pk, derived.pk]).count() == 0
+        assert PolyModularInterface.objects.filter(pk=derived.pk).count() == 0
+        remaining = list(PolyInterface.objects.order_by("pk"))
+        assert len(remaining) == 1
+        assert isinstance(remaining[0], PolyWirelessInterface)
+
+    def test_plain_model_delete_unchanged(self):
+        from .models import Base, Child, GrandChild
+
+        grand_child = GrandChild.objects.create()
+
+        grand_child.delete()
+
+        assert Base.objects.count() == 0
+        assert Child.objects.count() == 0
+        assert GrandChild.objects.count() == 0
+
+    def test_keep_parents_false_unchanged_for_polymorphic_delete(self):
+        from polymorphic.tests.test_migrations.models import (
+            BasePolyModel,
+            ChildPolyModel,
+            GrandChildPolyModel,
+        )
+
+        obj = GrandChildPolyModel.objects.create(name="base", description="child", extra_info="leaf")
+        obj.delete(keep_parents=False)
+
+        assert BasePolyModel.objects.count() == 0
+        assert ChildPolyModel.objects.count() == 0
+        assert GrandChildPolyModel.objects.count() == 0
 
     def test_delete_keep_parents(self):
         """
